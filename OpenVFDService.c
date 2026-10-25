@@ -14,6 +14,9 @@
 #include <sys/stat.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #define UNUSED(x)	(void*)(x)
 #define DRV_NAME	"/dev/" DEV_NAME
@@ -112,10 +115,12 @@ void set_icon(const char *name, bool on)
 	close(fd);
 }
 
+static int net_eth = -1, net_wifi = -1;
+
 // Light the eth and wifi icons while the interface has a link.
 void update_network_icons(void)
 {
-	static int eth = -1, wifi = -1;
+	int eth = net_eth, wifi = net_wifi;
 	struct ifaddrs *ifaddr, *ifa;
 	int new_eth = 0, new_wifi = 0;
 
@@ -139,7 +144,29 @@ void update_network_icons(void)
 		set_icon("wifi", new_wifi);
 		wifi = new_wifi;
 	}
+	net_eth = eth;
+	net_wifi = wifi;
 }
+
+void clear_status_icons(void)
+{
+	set_icon("power", false);
+	set_icon("eth", false);
+	set_icon("wifi", false);
+	net_eth = net_wifi = -1;
+}
+
+#ifdef __ANDROID__
+// Front panel settings from the settings app, re-read on every tick.
+static int prop_int(const char *name, int def)
+{
+	char value[PROP_VALUE_MAX];
+
+	if (__system_property_get(name, value) <= 0)
+		return def;
+	return atoi(value);
+}
+#endif
 
 void led_display_loop(const struct display_setup *setup)
 {
@@ -150,10 +177,12 @@ void led_display_loop(const struct display_setup *setup)
 	time_t now;
 	struct tm *timenow;
 	unsigned int ticks = 0;
+	bool enabled = true, new_enabled = true;
+	bool is_12h = setup->is_12h;
+	bool icons = false, new_icons = setup->status_icons;
+	int brightness = -1, new_brightness = -1;
 
 	memset(&data, 0, sizeof(data));
-	if (setup->status_icons)
-		set_icon("power", true);
 
 	if (setup->user_string) {
 		use_user_string = true;
@@ -175,8 +204,31 @@ void led_display_loop(const struct display_setup *setup)
 				}
 
 				select_display_type();
+#ifdef __ANDROID__
+				new_enabled = prop_int("persist.sys.openvfd.enable", 1) != 0;
+				is_12h = prop_int("persist.sys.openvfd.clock_12h", setup->is_12h) != 0;
+				new_icons = prop_int("persist.sys.openvfd.icons", setup->status_icons) != 0;
+				new_brightness = prop_int("persist.sys.openvfd.brightness", -1);
+#endif
+				if (new_enabled != enabled) {
+					int power = new_enabled;
+					ioctl(openvfd_fd, VFD_IOC_POWER, &power);
+					enabled = new_enabled;
+				}
+				// Setting the brightness also powers the display on.
+				if (enabled && new_brightness >= 0 && new_brightness != brightness) {
+					ioctl(openvfd_fd, VFD_IOC_SBRIGHT, &new_brightness);
+					brightness = new_brightness;
+				}
+				if (new_icons != icons) {
+					if (new_icons)
+						set_icon("power", true);
+					else
+						clear_status_icons();
+					icons = new_icons;
+				}
 				// Every 2 s, the loop runs every 0.5 s.
-				if (setup->status_icons && !(ticks++ % 4))
+				if (icons && !(ticks++ % 4))
 					update_network_icons();
 				if (sync_data.useBuffer && (sync_data.display_data.mode == DISPLAY_MODE_CLOCK ||
 						sync_data.display_data.mode == DISPLAY_MODE_DATE)) {
@@ -216,7 +268,7 @@ void led_display_loop(const struct display_setup *setup)
 					} else if (!use_user_string) {
 						if (data.mode != DISPLAY_MODE_DATE)
 							data.mode = DISPLAY_MODE_CLOCK;
-						if (setup->is_12h) {
+						if (is_12h) {
 							if (timenow->tm_hour == 0)
 								data.time_date.hours = 12;
 							else if (timenow->tm_hour > 12)
@@ -235,7 +287,8 @@ void led_display_loop(const struct display_setup *setup)
 						data.colon_on = !data.colon_on;
 					}
 				}
-				ret = write(openvfd_fd,&data,sizeof(data));
+				if (enabled)
+					ret = write(openvfd_fd,&data,sizeof(data));
 			}
 			pthread_mutex_unlock(&sync_data.mutex);
 		} else {
